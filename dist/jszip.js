@@ -165,7 +165,8 @@ CompressedObject.prototype = {
                 password: password,
                 method: this.encryptionInfo.method,
                 crc32: this.encryptionInfo.crc32,
-                lastModTime: this.encryptionInfo.lastModTime
+                dosDateRaw: this.encryptionInfo.dosDateRaw,
+                bitFlag: this.encryptionInfo.bitFlag
             }));
         }
         
@@ -370,7 +371,8 @@ TraditionalEncryption.prototype = {
      */
     updateKeys: function(byte) {
         this.keys[0] = encryptionUtils.updateCRC32(this.keys[0], byte);
-        this.keys[1] = (((this.keys[1] + (this.keys[0] & 0xFF)) & 0xFFFFFFFF) * 134775813 + 1) & 0xFFFFFFFF;
+        this.keys[1] = (this.keys[1] + (this.keys[0] & 0xFF)) >>> 0;
+        this.keys[1] = (Math.imul(this.keys[1], 134775813) + 1) >>> 0;
         this.keys[2] = encryptionUtils.updateCRC32(this.keys[2], (this.keys[1] >>> 24) & 0xFF);
     },
 
@@ -416,11 +418,18 @@ TraditionalEncryption.prototype = {
             header[i] = this.decryptByte(data[i]);
         }
 
-        // Verify password using last byte of header
-        // It should match either high byte of CRC32 or high byte of lastModTime
+        // Verify password using last byte(s) of header
+        // According to APPNOTE.TXT:
+        // - PKZIP < 2.0: uses 2 bytes (header[10-11]) = CRC32 >> 8 (bytes 1-2 of CRC)
+        // - PKZIP >= 2.0: uses 1 byte (header[11]) = CRC32 >> 24 (byte 3 of CRC)  
+        // Some implementations also accept time byte as alternative
         var checkByte = header[11];
-        var valid = (checkByte === ((crc32 >>> 24) & 0xFF)) ||
-                    (checkByte === ((lastModTime >>> 8) & 0xFF));
+        var checkByte2 = header[10];
+        
+        // Try multiple verification methods for compatibility
+        var valid = (checkByte === ((crc32 >>> 24) & 0xFF)) ||  // PKZIP 2.0+ CRC high byte
+                    (checkByte === ((lastModTime >>> 8) & 0xFF)) ||  // Time high byte
+                    (checkByte === ((crc32 >>> 16) & 0xFF) && checkByte2 === ((crc32 >>> 8) & 0xFF)); // PKZIP < 2.0 (2 bytes)
 
         if (!valid) {
             return {
@@ -445,10 +454,10 @@ TraditionalEncryption.prototype = {
      * Encrypt data buffer
      * @param {Uint8Array} data - Plain data
      * @param {number} crc32 - CRC32 of original file (for header)
-     * @param {number} lastModTime - Last modification time (fallback)
+     * @param {number} dosDateRaw - DOS date/time (not used for PKZIP 2.0+ encryption)
      * @return {Uint8Array} Encrypted data with 12-byte header
      */
-    encrypt: function(data, crc32, lastModTime) {
+    encrypt: function(data, crc32, dosDateRaw) {
         if (!this.keys) {
             this.initKeys();
         }
@@ -457,13 +466,35 @@ TraditionalEncryption.prototype = {
         // First 11 bytes are random, 12th byte is for verification
         var header = new Uint8Array(12);
         
-        // Generate pseudo-random header (simple implementation)
-        // In production, use crypto.getRandomValues() or equivalent
-        for (var i = 0; i < 11; i++) {
-            header[i] = (Math.random() * 256) | 0;
+        // Generate cryptographically secure random header
+        try {
+            // Try Node.js crypto
+            if (typeof require !== 'undefined') {
+                try {
+                    var crypto = require('crypto');
+                    var randomBytes = crypto.randomBytes(11);
+                    for (var i = 0; i < 11; i++) {
+                        header[i] = randomBytes[i];
+                    }
+                } catch (e) {
+                    // Fallback if crypto not available
+                    throw e;
+                }
+            } else if (typeof window !== 'undefined' && window.crypto && window.crypto.getRandomValues) {
+                // Browser crypto
+                window.crypto.getRandomValues(header.subarray(0, 11));
+            } else {
+                throw new Error('No secure random available');
+            }
+        } catch (e) {
+            // Fallback to Math.random (not cryptographically secure, but works)
+            for (var j = 0; j < 11; j++) {
+                header[j] = (Math.random() * 256) | 0;
+            }
         }
         
-        // Last byte for password verification (use CRC32 high byte)
+        // Last byte for password verification
+        // PKZIP 2.0+ uses CRC32 high byte (most compatible)
         header[11] = (crc32 >>> 24) & 0xFF;
 
         // Encrypt header
@@ -497,7 +528,7 @@ TraditionalEncryption.prototype = {
 module.exports = TraditionalEncryption;
 
 
-},{"./utils":7}],7:[function(require,module,exports){
+},{"./utils":7,"crypto":undefined}],7:[function(require,module,exports){
 "use strict";
 
 /**
@@ -1274,6 +1305,27 @@ var getCompression = function (fileCompression, zipCompression) {
 };
 
 /**
+ * Convert JavaScript Date to DOS date/time format (32-bit value)
+ * @param {Date} date - JavaScript Date object
+ * @return {number} DOS date/time as 32-bit integer
+ */
+var dateToDOS = function(date) {
+    var dosTime = date.getUTCHours();
+    dosTime = dosTime << 6;
+    dosTime = dosTime | date.getUTCMinutes();
+    dosTime = dosTime << 5;
+    dosTime = dosTime | (date.getUTCSeconds() / 2);
+
+    var dosDate = date.getUTCFullYear() - 1980;
+    dosDate = dosDate << 4;
+    dosDate = dosDate | (date.getUTCMonth() + 1);
+    dosDate = dosDate << 5;
+    dosDate = dosDate | date.getUTCDate();
+
+    return (dosDate << 16) | dosTime;
+};
+
+/**
  * Create a worker to generate a zip file.
  * @param {JSZip} zip the JSZip instance at the right root level.
  * @param {Object} options to generate the zip file.
@@ -1300,21 +1352,18 @@ exports.generateWorker = function (zip, options, comment) {
             // Insert EncryptWorker if password is provided and file is not a directory
             if (password && !dir) {
                 var EncryptWorker = require("../stream/EncryptWorker");
-                var Crc32Probe = require("../stream/Crc32Probe");
                 
-                // We need CRC32 for encryption header, use a probe to get it
-                worker = worker.pipe(new Crc32Probe());
+                // Convert date to DOS format for encryption header
+                var dosDate = date ? dateToDOS(date) : dateToDOS(new Date());
                 
                 // Add encryption worker
-                worker.on("end", function() {
-                    // CRC32 is now available in streamInfo
-                });
-                
+                // Note: _compressWorker already includes a Crc32Probe, so crc32 is in streamInfo
                 worker = worker.pipe(new EncryptWorker({
                     password: password,
                     method: encryptionMethod,
                     crc32: 0,  // Will be updated from streamInfo
-                    lastModTime: date ? date.getTime() : Date.now()
+                    dosDateRaw: dosDate,
+                    bitFlag: 0  // Will be set by ZipFileWorker
                 }));
             }
             
@@ -1338,7 +1387,7 @@ exports.generateWorker = function (zip, options, comment) {
     return zipFileWorker;
 };
 
-},{"../compressions":3,"../stream/Crc32Probe":26,"../stream/EncryptWorker":30,"./ZipFileWorker":10}],12:[function(require,module,exports){
+},{"../compressions":3,"../stream/EncryptWorker":30,"./ZipFileWorker":10}],12:[function(require,module,exports){
 "use strict";
 
 /**
@@ -2230,6 +2279,13 @@ DataReader.prototype = {
             (dostime >> 11) & 0x1f, // hour
             (dostime >> 5) & 0x3f, // minute
             (dostime & 0x1f) << 1)); // second
+    },
+    /**
+     * Get the next DOS date (raw 32-bit value).
+     * @return {number} the raw DOS time value.
+     */
+    readDOSDate: function() {
+        return this.readInt(4);
     }
 };
 module.exports = DataReader;
@@ -2575,16 +2631,21 @@ var TraditionalEncryption = require("../encryption/traditional");
  * @param {string} options.password - Password for decryption
  * @param {string} options.method - Encryption method ('traditional' or 'aes')
  * @param {number} options.crc32 - CRC32 of original file
- * @param {number} options.lastModTime - Last modification time
+ * @param {number} options.dosDateRaw - Raw DOS date (32-bit value)
+ * @param {number} options.bitFlag - General purpose bit flag from ZIP header
  */
 function DecryptWorker(options) {
     GenericWorker.call(this, "DecryptWorker");
-    
+
     this.password = options.password;
     this.method = options.method || "traditional";
     this.crc32 = options.crc32 || 0;
-    this.lastModTime = options.lastModTime || 0;
-    
+    this.dosDateRaw = options.dosDateRaw || 0;
+    this.bitFlag = options.bitFlag || 0;
+
+    // Validate encryption method immediately
+    this.validateEncryptionMethod();
+
     this.cipher = null;
     this.headerProcessed = false;
     this.buffer = null;
@@ -2593,62 +2654,49 @@ function DecryptWorker(options) {
 utils.inherits(DecryptWorker, GenericWorker);
 
 /**
+ * Validate encryption method and throw error if unsupported
+ * @private
+ */
+DecryptWorker.prototype.validateEncryptionMethod = function () {
+    if (this.method !== "traditional") {
+        var errorMsg;
+        if (this.method === "aes") {
+            errorMsg = "AES encryption is not supported. Only ZIP 2.0 Traditional (PKWARE) encryption is currently implemented.";
+        } else {
+            errorMsg = "Unsupported encryption method: '" + this.method + "'. Only 'traditional' encryption is supported.";
+        }
+        throw new Error(errorMsg);
+    }
+};
+
+/**
  * Initialize the cipher based on method
  */
-DecryptWorker.prototype.initCipher = function() {
-    if (this.method === "traditional") {
-        this.cipher = new TraditionalEncryption(this.password);
-    } else if (this.method === "aes") {
-        throw new Error("AES encryption is not yet implemented");
-    } else {
-        throw new Error("Unknown encryption method: " + this.method);
-    }
+DecryptWorker.prototype.initCipher = function () {
+    // Method is already validated in constructor
+    this.cipher = new TraditionalEncryption(this.password);
 };
 
 /**
  * @see GenericWorker.processChunk
  */
-DecryptWorker.prototype.processChunk = function(chunk) {
+DecryptWorker.prototype.processChunk = function (chunk) {
     if (!this.cipher) {
         this.initCipher();
     }
 
     var data = utils.transformTo("uint8array", chunk.data);
 
-    // For traditional encryption, we need at least 12 bytes for the header
+    // Process encryption header
     if (!this.headerProcessed) {
-        // Buffer data until we have enough for header
-        if (this.buffer) {
-            var combined = new Uint8Array(this.buffer.length + data.length);
-            combined.set(this.buffer, 0);
-            combined.set(data, this.buffer.length);
-            data = combined;
-            this.buffer = null;
+        data = this.processHeader(data);
+        if (!data) {
+            return; // Still buffering or header only
         }
-
-        if (this.method === "traditional" && data.length < 12) {
-            // Not enough data yet, buffer it
-            this.buffer = data;
-            return;
-        }
-
-        this.headerProcessed = true;
     }
 
-    // Decrypt data chunk by chunk
-    var decrypted;
-    
-    if (this.method === "traditional") {
-        // Use the cipher.decrypt method which handles the full process
-        var result = this.cipher.decrypt(data, this.crc32, this.lastModTime);
-        
-        if (!result.valid) {
-            this.error(new Error("Incorrect password or corrupted data"));
-            return;
-        }
-        
-        decrypted = result.data;
-    }
+    // Decrypt data
+    var decrypted = this.decryptData(data);
 
     if (decrypted && decrypted.length > 0) {
         this.push({
@@ -2659,9 +2707,80 @@ DecryptWorker.prototype.processChunk = function(chunk) {
 };
 
 /**
+ * Process and verify encryption header
+ * @private
+ */
+DecryptWorker.prototype.processHeader = function (data) {
+    // Buffer data until we have enough for header
+    if (this.buffer) {
+        var combined = new Uint8Array(this.buffer.length + data.length);
+        combined.set(this.buffer, 0);
+        combined.set(data, this.buffer.length);
+        data = combined;
+        this.buffer = null;
+    }
+
+    // Traditional encryption requires 12-byte header
+    if (data.length < 12) {
+        this.buffer = data;
+        return null;
+    }
+
+    // Initialize cipher keys
+    if (!this.cipher.keys) {
+        this.cipher.initKeys();
+    }
+
+    // Decrypt and verify header
+    var header = new Uint8Array(12);
+    for (var i = 0; i < 12; i++) {
+        header[i] = this.cipher.decryptByte(data[i]);
+    }
+
+    // Verify password using last byte(s) of header
+    // According to APPNOTE.TXT and adm-zip implementation:
+    // - If bit 3 (0x08, FLG_DESC) is set: use time high byte
+    // - Otherwise: use CRC high byte
+    var checkByte = header[11];
+    var verifyByte;
+    
+    if ((this.bitFlag & 0x08) === 0x08) {
+        // Bit 3 set: use DOS time high byte (bits 8-15)
+        verifyByte = (this.dosDateRaw >>> 8) & 0xFF;
+    } else {
+        // Bit 3 not set: use CRC high byte
+        verifyByte = ((this.crc32 >>> 0) >>> 24) & 0xFF;
+    }
+    
+    var valid = (checkByte === verifyByte);
+
+    if (!valid) {
+        this.error(new Error("Incorrect password or corrupted data"));
+        return null;
+    }
+
+    this.headerProcessed = true;
+
+    // Return data without header
+    return data.length > 12 ? data.subarray(12) : null;
+};
+
+/**
+ * Decrypt data chunk
+ * @private
+ */
+DecryptWorker.prototype.decryptData = function (data) {
+    var decrypted = new Uint8Array(data.length);
+    for (var i = 0; i < data.length; i++) {
+        decrypted[i] = this.cipher.decryptByte(data[i]);
+    }
+    return decrypted;
+};
+
+/**
  * @see GenericWorker.flush
  */
-DecryptWorker.prototype.flush = function() {
+DecryptWorker.prototype.flush = function () {
     // Process any remaining buffered data
     if (this.buffer && this.buffer.length > 0) {
         this.error(new Error("Incomplete encrypted data"));
@@ -2672,7 +2791,7 @@ DecryptWorker.prototype.flush = function() {
 /**
  * @see GenericWorker.cleanUp
  */
-DecryptWorker.prototype.cleanUp = function() {
+DecryptWorker.prototype.cleanUp = function () {
     GenericWorker.prototype.cleanUp.call(this);
     this.cipher = null;
     this.buffer = null;
@@ -2695,7 +2814,8 @@ var TraditionalEncryption = require("../encryption/traditional");
  * @param {string} options.password - Password for encryption
  * @param {string} options.method - Encryption method ('traditional' or 'aes')
  * @param {number} options.crc32 - CRC32 of original file
- * @param {number} options.lastModTime - Last modification time
+ * @param {number} options.dosDateRaw - Raw DOS date (32-bit value)
+ * @param {number} options.bitFlag - General purpose bit flag
  */
 function EncryptWorker(options) {
     GenericWorker.call(this, "EncryptWorker");
@@ -2703,7 +2823,8 @@ function EncryptWorker(options) {
     this.password = options.password;
     this.method = options.method || "traditional";
     this.crc32 = options.crc32 || 0;
-    this.lastModTime = options.lastModTime || 0;
+    this.dosDateRaw = options.dosDateRaw || 0;
+    this.bitFlag = options.bitFlag || 0;
     
     this.cipher = null;
     this.headerEmitted = false;
@@ -2771,7 +2892,9 @@ EncryptWorker.prototype.flush = function() {
     var encrypted;
     
     if (this.method === "traditional") {
-        encrypted = this.cipher.encrypt(combined, crc32, this.lastModTime);
+        // For traditional encryption, use CRC32 high byte for verification
+        // (bit 3 is typically not set when creating new encrypted files)
+        encrypted = this.cipher.encrypt(combined, crc32, this.dosDateRaw);
     }
 
     // Update streamInfo with new compressed size (original + 12 bytes header)
@@ -2912,7 +3035,11 @@ GenericWorker.prototype = {
      */
     cleanUp : function () {
         this.streamInfo = this.generatedError = this.extraStreamInfo = null;
-        this._listeners = [];
+        this._listeners = {
+            "data":[],
+            "end":[],
+            "error":[]
+        };
     },
     /**
      * Trigger an event. This will call registered callback with the provided arg.
@@ -2920,7 +3047,7 @@ GenericWorker.prototype = {
      * @param {Object} arg the argument to call the callback with.
      */
     emit : function (name, arg) {
-        if (this._listeners[name]) {
+        if (this._listeners && this._listeners[name]) {
             for(var i = 0; i < this._listeners[name].length; i++) {
                 this._listeners[name][i].call(this, arg);
             }
@@ -3605,7 +3732,7 @@ var support = require("./support");
 var base64 = require("./base64");
 var nodejsUtils = require("./nodejsUtils");
 var external = require("./external");
-require("setimmediate");
+// require("setimmediate"); // Removed for WeChat Mini Program compatibility
 
 
 /**
@@ -4003,9 +4130,9 @@ exports.pretty = function(str) {
  * @param {Array} args the arguments to give to the callback.
  */
 exports.delay = function(callback, args, self) {
-    setImmediate(function () {
+    setTimeout(function () {
         callback.apply(self || null, args || []);
-    });
+    }, 0);
 };
 
 /**
@@ -4101,7 +4228,7 @@ exports.prepareContent = function(name, inputData, isBinary, isOptimizedBinarySt
     });
 };
 
-},{"./base64":1,"./external":8,"./nodejsUtils":16,"./support":33,"setimmediate":74}],36:[function(require,module,exports){
+},{"./base64":1,"./external":8,"./nodejsUtils":16,"./support":33}],36:[function(require,module,exports){
 "use strict";
 var readerFor = require("./reader/readerFor");
 var utils = require("./utils");
@@ -4466,11 +4593,17 @@ ZipEntry.prototype = {
         var encryptionInfo = null;
         
         if (this.encrypted) {
+            // Use detected encryption method (detected in readCentralPart)
+            var method = this.encryptionMethod || this.detectEncryptionMethod() || "traditional";
+            
             // Store encryption information for later use
+            // IMPORTANT: Use raw DOS time value, not JavaScript timestamp!
+            // The encryption header verification byte is extracted from DOS time format
             encryptionInfo = {
-                method: "traditional", // ZIP 2.0 encryption (AES would have different bit flags)
+                method: method,
                 crc32: this.crc32,
-                lastModTime: this.date ? this.date.getTime() : 0
+                dosDateRaw: this.dosDateRaw || 0,
+                bitFlag: this.bitFlag || 0
             };
         }
         
@@ -4487,7 +4620,8 @@ ZipEntry.prototype = {
         // this.versionNeeded = reader.readInt(2);
         this.bitFlag = reader.readInt(2);
         this.compressionMethod = reader.readString(2);
-        this.date = reader.readDate();
+        this.dosDateRaw = reader.readDOSDate();
+        this.date = this.dosDateToJSDate(this.dosDateRaw);
         this.crc32 = reader.readInt(4);
         this.compressedSize = reader.readInt(4);
         this.uncompressedSize = reader.readInt(4);
@@ -4514,6 +4648,11 @@ ZipEntry.prototype = {
         this.readExtraFields(reader);
         this.parseZIP64ExtraField(reader);
         this.fileComment = reader.readData(this.fileCommentLength);
+        
+        // Detect encryption method after reading extra fields
+        if (this.encrypted) {
+            this.encryptionMethod = this.detectEncryptionMethod();
+        }
     },
 
     /**
@@ -4675,6 +4814,46 @@ ZipEntry.prototype = {
             return utf8.utf8decode(extraReader.readData(ucommentField.length - 5));
         }
         return null;
+    },
+
+    /**
+     * Detect the encryption method used for this file.
+     * @return {string} 'traditional' or 'aes', or null if not encrypted
+     */
+    detectEncryptionMethod: function() {
+        if (!this.encrypted) {
+            return null;
+        }
+
+        // Check compression method: 99 (0x63) indicates AES encryption
+        // compressionMethod is stored as 2-byte string (little-endian)
+        var compressionMethodCode = this.compressionMethod.charCodeAt(0) | (this.compressionMethod.charCodeAt(1) << 8);
+        if (compressionMethodCode === 99) {
+            return "aes";
+        }
+
+        // Check for WinZip AES Extra Field (0x9901)
+        if (this.extraFields && this.extraFields[0x9901]) {
+            return "aes";
+        }
+
+        // Default to traditional encryption
+        return "traditional";
+    },
+    
+    /**
+     * Convert DOS date to JavaScript Date
+     * @param {number} dosDate - Raw DOS date (32-bit)
+     * @return {Date} JavaScript Date object
+     */
+    dosDateToJSDate: function(dosDate) {
+        return new Date(Date.UTC(
+            ((dosDate >> 25) & 0x7f) + 1980, // year
+            ((dosDate >> 21) & 0x0f) - 1, // month
+            (dosDate >> 16) & 0x1f, // day
+            (dosDate >> 11) & 0x1f, // hour
+            (dosDate >> 5) & 0x3f, // minute
+            (dosDate & 0x1f) << 1)); // second
     }
 };
 module.exports = ZipEntry;
@@ -14279,7 +14458,7 @@ Writable.prototype._destroy = function (err, cb) {
   cb(err);
 };
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./_stream_duplex":62,"./internal/streams/destroy":68,"./internal/streams/stream":69,"core-util-is":39,"inherits":41,"process-nextick-args":70,"safe-buffer":73,"util-deprecate":75}],67:[function(require,module,exports){
+},{"./_stream_duplex":62,"./internal/streams/destroy":68,"./internal/streams/stream":69,"core-util-is":39,"inherits":41,"process-nextick-args":70,"safe-buffer":73,"util-deprecate":74}],67:[function(require,module,exports){
 'use strict';
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
@@ -14866,196 +15045,6 @@ SafeBuffer.allocUnsafeSlow = function (size) {
 }
 
 },{"buffer":undefined}],74:[function(require,module,exports){
-(function (global){
-(function (global, undefined) {
-    "use strict";
-
-    if (global.setImmediate) {
-        return;
-    }
-
-    var nextHandle = 1; // Spec says greater than zero
-    var tasksByHandle = {};
-    var currentlyRunningATask = false;
-    var doc = global.document;
-    var registerImmediate;
-
-    function setImmediate(callback) {
-      // Callback can either be a function or a string
-      if (typeof callback !== "function") {
-        callback = new Function("" + callback);
-      }
-      // Copy function arguments
-      var args = new Array(arguments.length - 1);
-      for (var i = 0; i < args.length; i++) {
-          args[i] = arguments[i + 1];
-      }
-      // Store and register the task
-      var task = { callback: callback, args: args };
-      tasksByHandle[nextHandle] = task;
-      registerImmediate(nextHandle);
-      return nextHandle++;
-    }
-
-    function clearImmediate(handle) {
-        delete tasksByHandle[handle];
-    }
-
-    function run(task) {
-        var callback = task.callback;
-        var args = task.args;
-        switch (args.length) {
-        case 0:
-            callback();
-            break;
-        case 1:
-            callback(args[0]);
-            break;
-        case 2:
-            callback(args[0], args[1]);
-            break;
-        case 3:
-            callback(args[0], args[1], args[2]);
-            break;
-        default:
-            callback.apply(undefined, args);
-            break;
-        }
-    }
-
-    function runIfPresent(handle) {
-        // From the spec: "Wait until any invocations of this algorithm started before this one have completed."
-        // So if we're currently running a task, we'll need to delay this invocation.
-        if (currentlyRunningATask) {
-            // Delay by doing a setTimeout. setImmediate was tried instead, but in Firefox 7 it generated a
-            // "too much recursion" error.
-            setTimeout(runIfPresent, 0, handle);
-        } else {
-            var task = tasksByHandle[handle];
-            if (task) {
-                currentlyRunningATask = true;
-                try {
-                    run(task);
-                } finally {
-                    clearImmediate(handle);
-                    currentlyRunningATask = false;
-                }
-            }
-        }
-    }
-
-    function installNextTickImplementation() {
-        registerImmediate = function(handle) {
-            process.nextTick(function () { runIfPresent(handle); });
-        };
-    }
-
-    function canUsePostMessage() {
-        // The test against `importScripts` prevents this implementation from being installed inside a web worker,
-        // where `global.postMessage` means something completely different and can't be used for this purpose.
-        if (global.postMessage && !global.importScripts) {
-            var postMessageIsAsynchronous = true;
-            var oldOnMessage = global.onmessage;
-            global.onmessage = function() {
-                postMessageIsAsynchronous = false;
-            };
-            global.postMessage("", "*");
-            global.onmessage = oldOnMessage;
-            return postMessageIsAsynchronous;
-        }
-    }
-
-    function installPostMessageImplementation() {
-        // Installs an event handler on `global` for the `message` event: see
-        // * https://developer.mozilla.org/en/DOM/window.postMessage
-        // * http://www.whatwg.org/specs/web-apps/current-work/multipage/comms.html#crossDocumentMessages
-
-        var messagePrefix = "setImmediate$" + Math.random() + "$";
-        var onGlobalMessage = function(event) {
-            if (event.source === global &&
-                typeof event.data === "string" &&
-                event.data.indexOf(messagePrefix) === 0) {
-                runIfPresent(+event.data.slice(messagePrefix.length));
-            }
-        };
-
-        if (global.addEventListener) {
-            global.addEventListener("message", onGlobalMessage, false);
-        } else {
-            global.attachEvent("onmessage", onGlobalMessage);
-        }
-
-        registerImmediate = function(handle) {
-            global.postMessage(messagePrefix + handle, "*");
-        };
-    }
-
-    function installMessageChannelImplementation() {
-        var channel = new MessageChannel();
-        channel.port1.onmessage = function(event) {
-            var handle = event.data;
-            runIfPresent(handle);
-        };
-
-        registerImmediate = function(handle) {
-            channel.port2.postMessage(handle);
-        };
-    }
-
-    function installReadyStateChangeImplementation() {
-        var html = doc.documentElement;
-        registerImmediate = function(handle) {
-            // Create a <script> element; its readystatechange event will be fired asynchronously once it is inserted
-            // into the document. Do so, thus queuing up the task. Remember to clean up once it's been called.
-            var script = doc.createElement("script");
-            script.onreadystatechange = function () {
-                runIfPresent(handle);
-                script.onreadystatechange = null;
-                html.removeChild(script);
-                script = null;
-            };
-            html.appendChild(script);
-        };
-    }
-
-    function installSetTimeoutImplementation() {
-        registerImmediate = function(handle) {
-            setTimeout(runIfPresent, 0, handle);
-        };
-    }
-
-    // If supported, we should attach to the prototype of global, since that is where setTimeout et al. live.
-    var attachTo = Object.getPrototypeOf && Object.getPrototypeOf(global);
-    attachTo = attachTo && attachTo.setTimeout ? attachTo : global;
-
-    // Don't get fooled by e.g. browserify environments.
-    if ({}.toString.call(global.process) === "[object process]") {
-        // For Node.js before 0.9
-        installNextTickImplementation();
-
-    } else if (canUsePostMessage()) {
-        // For non-IE10 modern browsers
-        installPostMessageImplementation();
-
-    } else if (global.MessageChannel) {
-        // For web workers, where supported
-        installMessageChannelImplementation();
-
-    } else if (doc && "onreadystatechange" in doc.createElement("script")) {
-        // For IE 6–8
-        installReadyStateChangeImplementation();
-
-    } else {
-        // For older browsers
-        installSetTimeoutImplementation();
-    }
-
-    attachTo.setImmediate = setImmediate;
-    attachTo.clearImmediate = clearImmediate;
-}(typeof self === "undefined" ? typeof global === "undefined" ? this : global : self));
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],75:[function(require,module,exports){
 
 /**
  * For Node.js, simply re-export the core `util.deprecate` function.
