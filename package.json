@@ -5,6 +5,7 @@
   "description": "Create, read and edit .zip files with JavaScript http://stuartk.com/jszip",
   "scripts": {
     "build": "grunt build",
+    "build:mp": "rollup -c rollup.config.js",
     "test": "npm run test-node && npm run test-browser && tsc",
     "test-node": "qunit --require ./test/helpers/test-utils.js --require ./test/helpers/node-test-utils.js test/asserts/",
     "test-browser": "grunt build && node test/run.js --test",
@@ -43,6 +44,10 @@
     "inflate"
   ],
   "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.0",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-replace": "^6.0.2",
+    "@rollup/plugin-terser": "^0.4.4",
     "benchmark": "^2.1.4",
     "browserify": "~13.0.0",
     "eslint": "^8.18.0",
@@ -55,6 +60,8 @@
     "package-json-versionify": "1.0.2",
     "playwright": "^1.51.0",
     "qunit": "~2.9.2",
+    "rollup": "^4.53.3",
+    "rollup-plugin-license": "^3.6.0",
     "tmp": "0.0.28",
     "typescript": "^4.6.3"
   },

@@ -40,7 +40,30 @@ module.exports = function(grunt) {
 
     grunt.loadNpmTasks("grunt-browserify");
     grunt.loadNpmTasks("grunt-contrib-uglify");
+    grunt.loadNpmTasks("grunt-run");
 
+    // 原有构建任务
     grunt.registerTask("build", ["browserify", "uglify"]);
+    
+    // 微信小程序专用构建任务
+    grunt.registerTask("build:mp", "Build for WeChat MiniProgram", function() {
+        const done = this.async();
+        const { spawn } = require("child_process");
+        
+        console.log("Building JSZip for WeChat MiniProgram...");
+        const rollup = spawn("npx", ["rollup", "-c", "rollup.config.js"], {
+            stdio: "inherit"
+        });
+        
+        rollup.on("close", function(code) {
+            if (code === 0) {
+                console.log("WeChat MiniProgram build completed!");
+                done();
+            } else {
+                done(new Error("Rollup build failed with code " + code));
+            }
+        });
+    });
+    
     grunt.registerTask("default", ["build"]);
 };
